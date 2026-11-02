@@ -137,12 +137,30 @@ float32 の複合信号を DSD256 にして 20 kHz でブリックウォール�
 - 入力：WAV（8/16/24/32 bit 整数、32/64 bit float、WAVE_FORMAT_EXTENSIBLE）、FLAC（〜32 bit）。1〜6 ch。
 - 出力：DSF（4096 byte ブロック・LSB ファースト）、DFF（DSDIFF 1.5、非圧縮）。
   どちらも 4 GB を超えるファイルに対応。
-- メタデータ（タグ）は現状コピーしません。
+- メタデータ（タグ）は CLI 版ではコピーしません（ID3v2 タグおよびアルバムアートの引き継ぎに対応した foobar2000 用プラグイン版は [`foo_deltarec`](https://github.com/yasudaz/foo_deltarec) を参照してください）。
 
 ## 速度
 
-1 ch あたり 1 スレッド。DSD256 で実時間の 4〜8 倍程度（CPU 依存）。
-変調器は本質的に逐次計算なので、ステレオ 60 分のアルバムで数分〜十数分が目安です。
+1 ch あたり 1 スレッド（マルチコア CPU では 1 ch あたり前段・後段の 2 スレッドパイプライン）。本フォークの AVX2・キャッシュタイリング最適化により、DSD256 で実時間の **7〜15 倍程度**（オリジナル `0.1.0` 比で出力結果 100% ビット完全一致のまま約 3.2 倍高速化）で変換できます。
+
+## オリジナル（[Imaha486/deltarec](https://github.com/Imaha486/deltarec)）からの変更点
+
+本リポジトリは [Imaha486/deltarec](https://github.com/Imaha486/deltarec) をフォークし、以下の CPU パフォーマンス最適化を加えたものです（詳細は [CHANGELOG.md](CHANGELOG.md) を参照）：
+
+1. **ポリフェーズ FIR の転置レイアウトと AVX2 ベクトル化 (`src/resampler.hpp`)**
+   - 2 のべき乗補間パス（`M == 1`：44.1/48 kHz 系の Stage 1 およびすべての Stage 2）向けに転置係数テーブル `ht_`（`[tapsPerPhase][L]`）を追加し、AVX2 FMA（`_mm256_fmadd_pd`）により 1 入力サンプルのブロードキャストに対して 4 位相分の積和を並列計算。
+2. **ΔΣ 変調器の状態更新 SIMD レジスタ常駐化と 2 パス分離 (`src/modulator.hpp`)**
+   - 7 次誤差帰還ループ内の状態ベクトル `s_[0..7]` と NTF 係数 `k_[0..7]` を 128-bit XMM レジスタに常駐化（`_mm_add_pd` / `_mm_mul_pd` / `_mm_alignr_epi8`）。
+   - 入力リミッタ（`[-limit, +limit]`）と xorshift64* による TPDF ディザ生成・加算を 1-bit 帰還ループの前段パスに分離し、逐次ループ内の分岐と乱数依存チェインを排除。
+3. **L1/L2 キャッシュ・タイリング (`src/main.cpp`)**
+   - 16,384 フレームのバッチを `ChannelPipe` 内で 512 フレーム単位のサブブロックに分割して処理することで、中間バッファ（Stage 1: `32 KB`、Stage 2: `1 MB`）が L1/L2 キャッシュに常駐するようにし、DRAM へのスピル（ch あたり約 32 MB）を解消。
+4. **チャンネル内ロックフリー SPSC パイプラインと常駐スレッドプール (`src/main.cpp`)**
+   - 論理コア数に余裕がある環境（`hc >= ch * 2`）では、2 スロットのロックフリーリングバッファによりブロック `N+1` の FIR アップサンプリング＋ディザ生成（`PrepWorker`）とブロック `N` の 1-bit ΔΣ 変調（`ModWorker`）を別コアでオーバーラップ実行。
+   - バッチごとの `std::thread` 生成・破棄を廃止し、ファイル変換全体でスレッドプール（`ChannelWorkerPool`）を再利用。
+5. **ビット完全一致（Bit-Exact）の保証**
+   - `/fp:precise` と IEEE-754 の演算順序を厳密に維持しており、オリジナル `0.1.0` と 1 バイトの狂いもない完全一致の `.dsf` / `.dff` を出力します。
+
+また、本エンジンをベースに foobar2000 上の任意のデコード可能フォーマットから右クリックで DSD 変換・ID3v2 タグ＆カバーアートのコピーを行うプラグイン版を **[yasudaz/foo_deltarec](https://github.com/yasudaz/foo_deltarec)** にて公開しています。
 
 ## ライセンスと特許について
 
@@ -167,5 +185,6 @@ Converters*）に基づく一般的な手法のみで構成され、他社製品
 
 ## 謝辞
 
+- **[Imaha486](https://github.com/Imaha486)** — オリジナルの [deltarec](https://github.com/Imaha486/deltarec) の作者。明快で美しいアーキテクチャと高精度な NTF・ポリフェーズ FIR 設計を実装し、MIT ライセンスのオープンソースとして公開されたことに深く感謝いたします。
 - David Reid — dr_libs
 - R. Schreier, G. C. Temes — *Understanding Delta-Sigma Data Converters*

@@ -139,13 +139,23 @@ in-band SNR.
 
 - Input: WAV (8/16/24/32-bit integer, 32/64-bit float, WAVE_FORMAT_EXTENSIBLE), FLAC (up to 32-bit). 1–6 channels.
 - Output: DSF (4096-byte blocks, LSB first), DFF (DSDIFF 1.5, uncompressed). Both handle files > 4 GB.
-- Tags / metadata are not copied yet.
+- Tags / metadata are not copied in the CLI version (see [`foo_deltarec`](https://github.com/yasudaz/foo_deltarec) for foobar2000 integration with full ID3v2 tag & cover art copying).
 
 ## Speed
 
-One thread per channel. Roughly 4–8 × real time at DSD256 depending on the CPU; the
-modulator is inherently sequential. Expect a few minutes to a dozen minutes for a
-60-minute stereo album.
+One thread per channel (or two pipelined threads per channel on multi-core CPUs). With the AVX2 and cache-tiling optimizations in this fork, conversion runs at roughly **7–15 × real time** at DSD256 depending on the CPU (~3.2× faster than original `0.1.0` while producing 100% bit-identical output).
+
+## Changes from Upstream ([Imaha486/deltarec](https://github.com/Imaha486/deltarec))
+
+This repository is a fork of [Imaha486/deltarec](https://github.com/Imaha486/deltarec) with CPU performance optimizations (documented in [CHANGELOG.md](CHANGELOG.md)):
+
+1. **AVX2 Transposed Polyphase FIR (`src/resampler.hpp`)**: Added a transposed coefficient layout (`ht_`) that computes 4 polyphase branches simultaneously using AVX2 FMA (`_mm256_fmadd_pd`) when `M == 1` (power-of-2 interpolation in Stage 1 and Stage 2).
+2. **SIMD Register-Resident ΔΣ Modulator (`src/modulator.hpp`)**: Kept the 7th-order error-feedback state vector (`s_[0..7]`) and NTF coefficients (`k_[0..7]`) in XMM registers across iterations (`_mm_add_pd` / `_mm_mul_pd` / `_mm_alignr_epi8`), and separated input limiting (`[-limit, +limit]`) and xorshift64* TPDF dither generation into a vectorizable pre-pass prior to the sequential 1-bit feedback loop.
+3. **L1/L2 Cache Tiling (`src/main.cpp`)**: Divided 16,384-frame PCM batches into 512-frame sub-blocks inside `ChannelPipe` so intermediate Stage 1 (`32 KB`) and Stage 2 (`1 MB`) buffers stay hot in L1/L2 cache instead of spilling ~32 MB per channel to main memory.
+4. **Lock-Free Per-Channel SPSC Pipeline & Persistent Worker Pool (`src/main.cpp`)**: Added a 2-slot lock-free ring buffer (`PrepWorker` → `ModWorker`) per channel to overlap Stage 1/2 FIR upsampling + dither generation of block `N+1` with 1-bit ΔΣ modulation of block `N`, and kept worker threads alive across the entire file.
+5. **Bit-Exact Output**: Maintained `/fp:precise` and exact IEEE-754 evaluation order in the recurrence, producing byte-for-byte identical `.dsf` / `.dff` output to upstream `0.1.0`.
+
+A companion foobar2000 x64 component built on this engine is available at **[yasudaz/foo_deltarec](https://github.com/yasudaz/foo_deltarec)**.
 
 ## License and patents
 
@@ -170,5 +180,6 @@ See [docs/RELEASING.ja.md](docs/RELEASING.ja.md) (Japanese). Tag `vX.Y.Z` and th
 
 ## Acknowledgements
 
+- **[Imaha486](https://github.com/Imaha486)** — Original author and creator of [deltarec](https://github.com/Imaha486/deltarec). Special thanks for designing and releasing this clean, high-precision ΔΣ modulator and polyphase FIR upsampler under the MIT License.
 - David Reid — dr_libs
 - R. Schreier, G. C. Temes — *Understanding Delta-Sigma Data Converters*
