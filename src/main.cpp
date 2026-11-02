@@ -7,15 +7,19 @@
 #define DR_WAV_IMPLEMENTATION
 #define DR_FLAC_IMPLEMENTATION
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <future>
+#include <memory>
+#include <mutex>
 #include <numeric>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "decoder.hpp"
@@ -187,19 +191,253 @@ struct ChannelPipe {
     std::vector<double> buf1, buf2;
     std::vector<uint8_t> bits;
 
-    void run(const double* in, size_t n, bool flush) {
-        buf1.clear(); buf2.clear(); bits.clear();
-        s1.process(in, n, buf1);
-        if (flush) s1.flush(buf1);
-        const std::vector<double>* src = &buf1;
-        if (twoStage) {
-            s2.process(buf1.data(), buf1.size(), buf2);
-            if (flush) s2.flush(buf2);
-            src = &buf2;
+    static constexpr size_t kRingSlots = 8;
+    static constexpr size_t kRingMask = kRingSlots - 1;
+    struct TileSlot {
+        std::vector<double> x;
+        std::vector<double> d;
+        size_t count = 0;
+        bool isEnd = false;
+    };
+    TileSlot ring[kRingSlots];
+    std::atomic<uint64_t> writeIdx{0};
+    std::atomic<uint64_t> readIdx{0};
+
+    std::thread prepThread;
+    std::mutex prepMu;
+    std::condition_variable prepCv;
+    const double* prepIn = nullptr;
+    size_t prepN = 0;
+    bool prepFlush = false;
+    bool prepHasWork = false;
+    bool prepStop = false;
+
+    ChannelPipe() {
+        prepThread = std::thread([this] { prepLoop(); });
+    }
+
+    ~ChannelPipe() {
+        {
+            std::lock_guard<std::mutex> lk(prepMu);
+            prepStop = true;
         }
-        mod.process(src->data(), src->size(), bits);
+        prepCv.notify_one();
+        if (prepThread.joinable()) prepThread.join();
+    }
+
+    ChannelPipe(const ChannelPipe&) = delete;
+    ChannelPipe& operator=(const ChannelPipe&) = delete;
+
+    static inline void spinPause(uint32_t& spins) {
+#if defined(__AVX2__) || defined(__SSE2__) || defined(_M_AMD64) || defined(_M_X64)
+        if (spins < 1024) {
+            _mm_pause();
+            ++spins;
+            return;
+        }
+#endif
+        std::this_thread::yield();
+    }
+
+    void pushSlot(const double* src, size_t count, bool isEnd) {
+        uint64_t w = writeIdx.load(std::memory_order_relaxed);
+        uint32_t spins = 0;
+        while (w - readIdx.load(std::memory_order_acquire) >= kRingSlots) {
+            spinPause(spins);
+        }
+        TileSlot& slot = ring[w & kRingMask];
+        slot.count = count;
+        slot.isEnd = isEnd;
+        if (count > 0) {
+            if (slot.x.size() < count) {
+                slot.x.resize(count);
+                slot.d.resize(count);
+            }
+            mod.prepare(src, slot.x.data(), slot.d.data(), count);
+        }
+        writeIdx.store(w + 1, std::memory_order_release);
+    }
+
+    void prepLoop() {
+        while (true) {
+            const double* in = nullptr;
+            size_t n = 0;
+            bool flush = false;
+            {
+                std::unique_lock<std::mutex> lk(prepMu);
+                prepCv.wait(lk, [this] { return prepStop || prepHasWork; });
+                if (prepStop) return;
+                in = prepIn;
+                n = prepN;
+                flush = prepFlush;
+                prepHasWork = false;
+            }
+
+            constexpr size_t kInTile = 512;
+            constexpr size_t kTile = 256;
+            for (size_t inPos = 0; inPos < n; inPos += kInTile) {
+                const size_t inChunk = std::min(kInTile, n - inPos);
+                const bool lastIn = (inPos + inChunk == n);
+                buf1.clear();
+                s1.process(in + inPos, inChunk, buf1);
+                if (flush && lastIn) s1.flush(buf1);
+
+                const double* p1 = buf1.data();
+                const size_t n1 = buf1.size();
+                if (!twoStage) {
+                    constexpr size_t kChunk = 4096;
+                    for (size_t pos = 0; pos < n1; pos += kChunk) {
+                        pushSlot(p1 + pos, std::min(kChunk, n1 - pos), false);
+                    }
+                } else {
+                    for (size_t pos = 0; pos < n1; pos += kTile) {
+                        const size_t chunk = std::min(kTile, n1 - pos);
+                        buf2.clear();
+                        s2.process(p1 + pos, chunk, buf2);
+                        pushSlot(buf2.data(), buf2.size(), false);
+                    }
+                    if (flush && lastIn) {
+                        buf2.clear();
+                        s2.flush(buf2);
+                        if (!buf2.empty()) pushSlot(buf2.data(), buf2.size(), false);
+                    }
+                }
+            }
+            if (n == 0 && flush) {
+                buf1.clear();
+                s1.flush(buf1);
+                if (!twoStage) {
+                    if (!buf1.empty()) pushSlot(buf1.data(), buf1.size(), false);
+                } else {
+                    if (!buf1.empty()) {
+                        buf2.clear();
+                        s2.process(buf1.data(), buf1.size(), buf2);
+                        if (!buf2.empty()) pushSlot(buf2.data(), buf2.size(), false);
+                    }
+                    buf2.clear();
+                    s2.flush(buf2);
+                    if (!buf2.empty()) pushSlot(buf2.data(), buf2.size(), false);
+                }
+            }
+            pushSlot(nullptr, 0, true);
+        }
+    }
+
+    void run(const double* in, size_t n, bool flush) {
+        bits.clear();
+        const uint32_t totalL = twoStage ? (s1.L() * s2.L()) : s1.L();
+        bits.reserve((n * totalL) / (8 * std::max(1u, s1.M())) + 256);
+
+        // Kick off Stage 1 + Stage 2 + Dither/Limiter on the dedicated Prep thread.
+        {
+            std::lock_guard<std::mutex> lk(prepMu);
+            prepIn = in;
+            prepN = n;
+            prepFlush = flush;
+            prepHasWork = true;
+        }
+        prepCv.notify_one();
+
+        // Consume prepared (x, d) tiles and run pure delta-sigma modulation on this thread.
+        uint64_t r = readIdx.load(std::memory_order_relaxed);
+        while (true) {
+            uint32_t spins = 0;
+            while (writeIdx.load(std::memory_order_acquire) == r) {
+                spinPause(spins);
+            }
+            TileSlot& slot = ring[r & kRingMask];
+            const size_t cnt = slot.count;
+            const bool end = slot.isEnd;
+            if (cnt > 0) {
+                mod.modulatePrepared(slot.x.data(), slot.d.data(), cnt, bits);
+            }
+            readIdx.store(++r, std::memory_order_release);
+            if (end) break;
+        }
         if (flush) mod.finish(bits);
     }
+};
+
+// Persistent worker pool for channels 1 .. ch-1 (channel 0 runs on the caller thread).
+class ChannelWorkerPool {
+public:
+    explicit ChannelWorkerPool(std::vector<std::unique_ptr<ChannelPipe>>& pipes) : pipes_(pipes) {
+        const size_t workers = pipes_.size() > 1 ? pipes_.size() - 1 : 0;
+        threads_.reserve(workers);
+        for (size_t w = 0; w < workers; ++w) {
+            const uint32_t chIdx = static_cast<uint32_t>(w + 1);
+            threads_.emplace_back([this, chIdx] { workerLoop(chIdx); });
+        }
+    }
+
+    ~ChannelWorkerPool() {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            stop_ = true;
+        }
+        cvStart_.notify_all();
+        for (auto& t : threads_) {
+            if (t.joinable()) t.join();
+        }
+    }
+
+    void runAll(const std::vector<std::vector<double>>& chan, size_t got, bool eof) {
+        const uint32_t ch = static_cast<uint32_t>(pipes_.size());
+        if (ch > 1) {
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                chanPtr_ = &chan;
+                got_ = got;
+                eof_ = eof;
+                pending_ = ch - 1;
+                ++gen_;
+            }
+            cvStart_.notify_all();
+        }
+        // Run channel 0 on the main thread concurrently.
+        pipes_[0]->run(chan[0].data(), got, eof);
+
+        if (ch > 1) {
+            std::unique_lock<std::mutex> lk(mu_);
+            cvDone_.wait(lk, [this] { return pending_ == 0; });
+        }
+    }
+
+private:
+    void workerLoop(uint32_t c) {
+        uint64_t myGen = 0;
+        while (true) {
+            const std::vector<std::vector<double>>* chan = nullptr;
+            size_t got = 0;
+            bool eof = false;
+            {
+                std::unique_lock<std::mutex> lk(mu_);
+                cvStart_.wait(lk, [&] { return stop_ || gen_ != myGen; });
+                if (stop_) return;
+                myGen = gen_;
+                chan = chanPtr_;
+                got = got_;
+                eof = eof_;
+            }
+            pipes_[c]->run((*chan)[c].data(), got, eof);
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                if (--pending_ == 0) cvDone_.notify_one();
+            }
+        }
+    }
+
+    std::vector<std::unique_ptr<ChannelPipe>>& pipes_;
+    std::vector<std::thread> threads_;
+    std::mutex mu_;
+    std::condition_variable cvStart_;
+    std::condition_variable cvDone_;
+    const std::vector<std::vector<double>>* chanPtr_ = nullptr;
+    size_t got_ = 0;
+    bool eof_ = false;
+    uint32_t pending_ = 0;
+    uint64_t gen_ = 0;
+    bool stop_ = false;
 };
 
 }  // namespace
@@ -224,17 +462,19 @@ int main(int argc, char** argv) {
 
         const double gain = 0.5 * std::pow(10.0, o.gainDb / 20.0);
 
-        std::vector<ChannelPipe> pipes(ch);
+        std::vector<std::unique_ptr<ChannelPipe>> pipes(ch);
         for (uint32_t c = 0; c < ch; ++c) {
-            pipes[c].s1.init(plan.s1);
-            pipes[c].twoStage = plan.L2 > 1;
-            if (pipes[c].twoStage) pipes[c].s2.init(plan.s2);
-            pipes[c].mod = DeltaSigmaModulator(plan.ntf, o.limit, o.dither, 8.0, 0x5eed1234u + c * 7919u);
+            pipes[c] = std::make_unique<ChannelPipe>();
+            pipes[c]->s1.init(plan.s1);
+            pipes[c]->twoStage = plan.L2 > 1;
+            if (pipes[c]->twoStage) pipes[c]->s2.init(plan.s2);
+            pipes[c]->mod = DeltaSigmaModulator(plan.ntf, o.limit, o.dither, 8.0, 0x5eed1234u + c * 7919u);
         }
 
         DsdWriter writer(o.output, o.format == "dff" ? DsdWriter::Format::DFF : DsdWriter::Format::DSF, ch, plan.fsDsd);
+        ChannelWorkerPool pool(pipes);
 
-        const size_t blockFrames = 8192;
+        const size_t blockFrames = 16384;
         std::vector<double> inter;
         std::vector<std::vector<double>> chan(ch);
         std::vector<std::vector<uint8_t>> outBits(ch);
@@ -249,14 +489,12 @@ int main(int argc, char** argv) {
             eof = got < blockFrames;
             for (uint32_t c = 0; c < ch; ++c) {
                 chan[c].resize(got);
-                for (size_t i = 0; i < got; ++i) chan[c][i] = inter[i * ch + c] * gain;
+                double* __restrict dst = chan[c].data();
+                const double* __restrict src = inter.data() + c;
+                for (size_t i = 0; i < got; ++i) dst[i] = src[i * ch] * gain;
             }
-            std::vector<std::future<void>> jobs;
-            for (uint32_t c = 0; c < ch; ++c) {
-                jobs.push_back(std::async(std::launch::async, [&, c] { pipes[c].run(chan[c].data(), got, eof); }));
-            }
-            for (auto& j : jobs) j.get();
-            for (uint32_t c = 0; c < ch; ++c) outBits[c].swap(pipes[c].bits);
+            pool.runAll(chan, got, eof);
+            for (uint32_t c = 0; c < ch; ++c) outBits[c].swap(pipes[c]->bits);
             writer.write(outBits);
             done += got;
             if (!o.quiet && total > 0) {
@@ -269,16 +507,16 @@ int main(int argc, char** argv) {
                 }
             }
         }
-        writer.finish(pipes[0].mod.stats().samples);
+        writer.finish(pipes[0]->mod.stats().samples);
         double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 
         if (!o.quiet) {
             std::fprintf(stderr, "\r  converting : done in %.1f s (%.1fx realtime)      \n", el, (done / double(fsIn)) / std::max(el, 1e-9));
             double peak = 0; uint64_t clips = 0, resets = 0;
             for (auto& p : pipes) {
-                peak = std::max(peak, p.mod.stats().peakInput);
-                clips += p.mod.stats().inputClips;
-                resets += p.mod.stats().resets;
+                peak = std::max(peak, p->mod.stats().peakInput);
+                clips += p->mod.stats().inputClips;
+                resets += p->mod.stats().resets;
             }
             std::fprintf(stderr, "  peak level : %.1f%% modulation (%.2f dBFS PCM equivalent)\n", 100.0 * peak, 20.0 * std::log10(std::max(peak, 1e-12) / 0.5));
             if (clips) std::fprintf(stderr, "  WARNING    : %llu samples hit the limiter - consider --gain -3\n", static_cast<unsigned long long>(clips));

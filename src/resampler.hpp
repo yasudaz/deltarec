@@ -10,8 +10,13 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <stdexcept>
 #include <vector>
+
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
 
 #include "ntf.hpp"  // kPi
 
@@ -82,9 +87,14 @@ public:
         // Polyphase decomposition: coef_[p][k] multiplies x[base - (K-1) + k]
         // (window stored oldest-first), i.e. h[p + (K-1-k)*L].
         coef_.assign(static_cast<size_t>(L_) * K_, 0.0);
-        for (uint32_t p = 0; p < L_; ++p)
-            for (uint32_t k = 0; k < K_; ++k)
-                coef_[static_cast<size_t>(p) * K_ + k] = h[p + (K_ - 1 - k) * L_];
+        coefT_.assign(static_cast<size_t>(K_) * L_, 0.0);
+        for (uint32_t p = 0; p < L_; ++p) {
+            for (uint32_t k = 0; k < K_; ++k) {
+                double v = h[p + (K_ - 1 - k) * L_];
+                coef_[static_cast<size_t>(p) * K_ + k] = v;
+                coefT_[static_cast<size_t>(k) * L_ + p] = v;
+            }
+        }
 
         buf_.assign(static_cast<size_t>(2) * K_, 0.0);
         pos_ = 0;
@@ -103,16 +113,38 @@ public:
 
     // Feed `count` input samples, appending output samples to `out`.
     void process(const double* in, size_t count, std::vector<double>& out) {
-        out.reserve(out.size() + (count * L_) / M_ + 2);
-        if (M_ == 1) { for (size_t i = 0; i < count; ++i) pushInterp(in[i], out); }
-        else         { for (size_t i = 0; i < count; ++i) pushRational(in[i], out); }
+        if (M_ == 1) {
+            size_t i = 0;
+            if (skipOut_ > 0) {
+                out.reserve(out.size() + count * L_);
+                while (i < count && skipOut_ > 0) {
+                    pushInterp(in[i++], out);
+                }
+            }
+            if (i < count) {
+                const size_t rem = count - i;
+                const size_t oldSize = out.size();
+                out.resize(oldSize + rem * L_);
+                double* outPtr = out.data() + oldSize;
+                const double* inPtr = in + i;
+                switch (L_) {
+                case 8:  processInterpFixed<8>(inPtr, rem, outPtr); break;
+                case 16: processInterpFixed<16>(inPtr, rem, outPtr); break;
+                case 32: processInterpFixed<32>(inPtr, rem, outPtr); break;
+                case 64: processInterpFixed<64>(inPtr, rem, outPtr); break;
+                default: processInterpGeneric(inPtr, rem, outPtr); break;
+                }
+            }
+        } else {
+            out.reserve(out.size() + (count * L_) / M_ + 2);
+            for (size_t i = 0; i < count; ++i) pushRational(in[i], out);
+        }
     }
 
     // Push zeros to drain the filter's group delay.
     void flush(std::vector<double>& out) {
-        for (uint32_t i = 0; i < flushInputs_; ++i) {
-            if (M_ == 1) pushInterp(0.0, out); else pushRational(0.0, out);
-        }
+        std::vector<double> zeros(flushInputs_, 0.0);
+        process(zeros.data(), zeros.size(), out);
     }
 
 private:
@@ -124,11 +156,99 @@ private:
         return win;
     }
 
-    inline double dot(uint32_t phase, const double* win) const {
-        const double* c = &coef_[static_cast<size_t>(phase) * K_];
+    inline double dot(uint32_t phase, const double* __restrict win) const {
+        const double* __restrict c = &coef_[static_cast<size_t>(phase) * K_];
         double acc = 0.0;
-        for (uint32_t k = 0; k < K_; ++k) acc += c[k] * win[k];
+        const uint32_t K = K_;
+        for (uint32_t k = 0; k < K; ++k) acc += c[k] * win[k];
         return acc;
+    }
+
+    template <uint32_t LFixed>
+    void processInterpFixed(const double* __restrict in, size_t count, double* __restrict outPtr) {
+        const uint32_t K = K_;
+        const double* __restrict coefT = coefT_.data();
+        for (size_t i = 0; i < count; ++i) {
+            const double* __restrict win = store(in[i]);
+#if defined(__AVX2__)
+            if constexpr (LFixed == 8) {
+                __m256d a0 = _mm256_setzero_pd(), a1 = _mm256_setzero_pd();
+                for (uint32_t k = 0; k < K; ++k) {
+                    __m256d w = _mm256_set1_pd(win[k]);
+                    const double* c = coefT + static_cast<size_t>(k) * 8;
+                    a0 = _mm256_add_pd(a0, _mm256_mul_pd(_mm256_loadu_pd(c + 0), w));
+                    a1 = _mm256_add_pd(a1, _mm256_mul_pd(_mm256_loadu_pd(c + 4), w));
+                }
+                _mm256_storeu_pd(outPtr + 0, a0);
+                _mm256_storeu_pd(outPtr + 4, a1);
+            } else if constexpr (LFixed == 16) {
+                __m256d a0 = _mm256_setzero_pd(), a1 = _mm256_setzero_pd();
+                __m256d a2 = _mm256_setzero_pd(), a3 = _mm256_setzero_pd();
+                for (uint32_t k = 0; k < K; ++k) {
+                    __m256d w = _mm256_set1_pd(win[k]);
+                    const double* c = coefT + static_cast<size_t>(k) * 16;
+                    a0 = _mm256_add_pd(a0, _mm256_mul_pd(_mm256_loadu_pd(c +  0), w));
+                    a1 = _mm256_add_pd(a1, _mm256_mul_pd(_mm256_loadu_pd(c +  4), w));
+                    a2 = _mm256_add_pd(a2, _mm256_mul_pd(_mm256_loadu_pd(c +  8), w));
+                    a3 = _mm256_add_pd(a3, _mm256_mul_pd(_mm256_loadu_pd(c + 12), w));
+                }
+                _mm256_storeu_pd(outPtr +  0, a0);
+                _mm256_storeu_pd(outPtr +  4, a1);
+                _mm256_storeu_pd(outPtr +  8, a2);
+                _mm256_storeu_pd(outPtr + 12, a3);
+            } else if constexpr (LFixed == 32) {
+                __m256d a0 = _mm256_setzero_pd(), a1 = _mm256_setzero_pd();
+                __m256d a2 = _mm256_setzero_pd(), a3 = _mm256_setzero_pd();
+                __m256d a4 = _mm256_setzero_pd(), a5 = _mm256_setzero_pd();
+                __m256d a6 = _mm256_setzero_pd(), a7 = _mm256_setzero_pd();
+                for (uint32_t k = 0; k < K; ++k) {
+                    __m256d w = _mm256_set1_pd(win[k]);
+                    const double* c = coefT + static_cast<size_t>(k) * 32;
+                    a0 = _mm256_add_pd(a0, _mm256_mul_pd(_mm256_loadu_pd(c +  0), w));
+                    a1 = _mm256_add_pd(a1, _mm256_mul_pd(_mm256_loadu_pd(c +  4), w));
+                    a2 = _mm256_add_pd(a2, _mm256_mul_pd(_mm256_loadu_pd(c +  8), w));
+                    a3 = _mm256_add_pd(a3, _mm256_mul_pd(_mm256_loadu_pd(c + 12), w));
+                    a4 = _mm256_add_pd(a4, _mm256_mul_pd(_mm256_loadu_pd(c + 16), w));
+                    a5 = _mm256_add_pd(a5, _mm256_mul_pd(_mm256_loadu_pd(c + 20), w));
+                    a6 = _mm256_add_pd(a6, _mm256_mul_pd(_mm256_loadu_pd(c + 24), w));
+                    a7 = _mm256_add_pd(a7, _mm256_mul_pd(_mm256_loadu_pd(c + 28), w));
+                }
+                _mm256_storeu_pd(outPtr +  0, a0);
+                _mm256_storeu_pd(outPtr +  4, a1);
+                _mm256_storeu_pd(outPtr +  8, a2);
+                _mm256_storeu_pd(outPtr + 12, a3);
+                _mm256_storeu_pd(outPtr + 16, a4);
+                _mm256_storeu_pd(outPtr + 20, a5);
+                _mm256_storeu_pd(outPtr + 24, a6);
+                _mm256_storeu_pd(outPtr + 28, a7);
+            } else
+#endif
+            {
+                alignas(32) double acc[LFixed] = {};
+                for (uint32_t k = 0; k < K; ++k) {
+                    const double wk = win[k];
+                    const double* __restrict c = coefT + static_cast<size_t>(k) * LFixed;
+                    for (uint32_t p = 0; p < LFixed; ++p) acc[p] += c[p] * wk;
+                }
+                std::memcpy(outPtr, acc, LFixed * sizeof(double));
+            }
+            outPtr += LFixed;
+        }
+    }
+
+    void processInterpGeneric(const double* __restrict in, size_t count, double* __restrict outPtr) {
+        const uint32_t L = L_, K = K_;
+        const double* __restrict coefT = coefT_.data();
+        for (size_t i = 0; i < count; ++i) {
+            const double* __restrict win = store(in[i]);
+            std::fill_n(outPtr, L, 0.0);
+            for (uint32_t k = 0; k < K; ++k) {
+                const double wk = win[k];
+                const double* __restrict c = coefT + static_cast<size_t>(k) * L;
+                for (uint32_t p = 0; p < L; ++p) outPtr[p] += c[p] * wk;
+            }
+            outPtr += L;
+        }
     }
 
     // Pure interpolation (M == 1): every input yields exactly L outputs.
@@ -157,6 +277,7 @@ private:
 
     uint32_t L_ = 1, M_ = 1, K_ = 0, N_ = 0;
     std::vector<double> coef_;
+    std::vector<double> coefT_;
     std::vector<double> buf_;
     uint32_t pos_ = 0;
     uint64_t inIndex_ = 0;
