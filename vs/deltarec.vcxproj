@@ -85,7 +85,6 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -131,7 +130,6 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'">
@@ -162,8 +160,10 @@
     <ClCompile Include="..\src\main.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="..\src\cuesheet.hpp" />
     <ClInclude Include="..\src\decoder.hpp" />
     <ClInclude Include="..\src\dsdwriter.hpp" />
+    <ClInclude Include="..\src\id3v2_builder.hpp" />
     <ClInclude Include="..\src\modulator.hpp" />
     <ClInclude Include="..\src\ntf.hpp" />
     <ClInclude Include="..\src\resampler.hpp" />

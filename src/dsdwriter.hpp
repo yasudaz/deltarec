@@ -8,6 +8,7 @@
 // the MSB and interleaves channels byte by byte.
 //
 // Input to write(): per-channel vectors of bytes packed LSB-first (DSF order).
+// Supports optional embedded ID3v2 metadata chunk at the end of the file.
 #pragma once
 #include <algorithm>
 #include <cstdint>
@@ -15,6 +16,13 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace deltarec {
 
@@ -25,16 +33,29 @@ public:
     DsdWriter(const std::string& path, Format fmt, uint32_t channels, uint32_t sampleRate)
         : fmt_(fmt), channels_(channels), rate_(sampleRate) {
         if (channels_ < 1 || channels_ > 6) throw std::runtime_error("1..6 channels supported");
+#ifdef _WIN32
+        int wlen = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
+        if (wlen > 0) {
+            std::wstring wpath(static_cast<size_t>(wlen), L'\0');
+            MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wpath.data(), wlen);
+            f_ = _wfopen(wpath.c_str(), L"wb");
+        }
+#else
         f_ = std::fopen(path.c_str(), "wb");
+#endif
         if (!f_) throw std::runtime_error("cannot open output file: " + path);
+        // Use a 256 KB stdio buffer to reduce syscall overhead.
+        std::setvbuf(f_, nullptr, _IOFBF, 256 * 1024);
         pending_.assign(channels_, {});
         writeHeader();
     }
+
     ~DsdWriter() {
         if (f_) {
             try { finish(0); } catch (...) {}
         }
     }
+
     DsdWriter(const DsdWriter&) = delete;
     DsdWriter& operator=(const DsdWriter&) = delete;
 
@@ -49,24 +70,44 @@ public:
     }
 
     // totalSamplesPerChannel is stored in the DSF header (DFF derives it from size).
-    void finish(uint64_t totalSamplesPerChannel) {
+    // id3v2Tag (optional): raw ID3v2 tag bytes to embed in the metadata chunk.
+    void finish(uint64_t totalSamplesPerChannel, const std::vector<uint8_t>& id3v2Tag = {}) {
         if (!f_) return;
         drain(true);
         if (fmt_ == Format::DSF) {
             uint64_t dataChunkSize = 12 + bytesWrittenPerCh_ * channels_;
+            uint64_t metaOffset = 0;
             uint64_t fileSize = 28 + 52 + dataChunkSize;
-            std::fseek(f_, 12, SEEK_SET);
+            if (!id3v2Tag.empty()) {
+                metaOffset = fileSize;
+                std::fwrite(id3v2Tag.data(), 1, id3v2Tag.size(), f_);
+                fileSize += id3v2Tag.size();
+            }
+            seek64(12);
             putU64(fileSize);
-            std::fseek(f_, 28 + 36, SEEK_SET);  // 'fmt ' chunk: sample-count field
+            putU64(metaOffset);
+            seek64(28 + 36);  // 'fmt ' chunk: sample-count field
             putU64(totalSamplesPerChannel);
-            std::fseek(f_, 28 + 52 + 4, SEEK_SET);
+            seek64(28 + 52 + 4);
             putU64(dataChunkSize);
         } else {
             uint64_t dsdChunkSize = bytesWrittenPerCh_ * channels_;
-            uint64_t frm8Size = frm8BodyBeforeData_ + 12 + dsdChunkSize;
-            std::fseek(f_, 4, SEEK_SET);
+            uint64_t extraId3ChunkBytes = 0;
+            if (!id3v2Tag.empty()) {
+                putTag("ID3 ");
+                putU64BE(id3v2Tag.size());
+                std::fwrite(id3v2Tag.data(), 1, id3v2Tag.size(), f_);
+                extraId3ChunkBytes = 12 + id3v2Tag.size();
+                if (id3v2Tag.size() & 1) {
+                    uint8_t pad = 0;
+                    std::fwrite(&pad, 1, 1, f_);
+                    ++extraId3ChunkBytes;
+                }
+            }
+            uint64_t frm8Size = frm8BodyBeforeData_ + 12 + dsdChunkSize + extraId3ChunkBytes;
+            seek64(4);
             putU64BE(frm8Size);
-            std::fseek(f_, static_cast<long>(dsdChunkOffset_ + 4), SEEK_SET);
+            seek64(static_cast<int64_t>(dsdChunkOffset_ + 4));
             putU64BE(dsdChunkSize);
         }
         std::fclose(f_);
@@ -76,6 +117,22 @@ public:
     uint64_t bytesPerChannelWritten() const { return bytesWrittenPerCh_; }
 
 private:
+    void seek64(int64_t pos) {
+#ifdef _WIN32
+        _fseeki64(f_, pos, SEEK_SET);
+#else
+        fseeko(f_, pos, SEEK_SET);
+#endif
+    }
+
+    int64_t tell64() {
+#ifdef _WIN32
+        return _ftelli64(f_);
+#else
+        return ftello(f_);
+#endif
+    }
+
     void putU32(uint32_t v) { uint8_t b[4] = {uint8_t(v), uint8_t(v >> 8), uint8_t(v >> 16), uint8_t(v >> 24)}; std::fwrite(b, 1, 4, f_); }
     void putU64(uint64_t v) { for (int i = 0; i < 8; ++i) { uint8_t b = uint8_t(v >> (8 * i)); std::fwrite(&b, 1, 1, f_); } }
     void putU32BE(uint32_t v) { uint8_t b[4] = {uint8_t(v >> 24), uint8_t(v >> 16), uint8_t(v >> 8), uint8_t(v)}; std::fwrite(b, 1, 4, f_); }
@@ -85,7 +142,7 @@ private:
 
     void writeHeader() {
         if (fmt_ == Format::DSF) {
-            putTag("DSD "); putU64(28); putU64(0 /*file size, patched*/); putU64(0 /*no metadata*/);
+            putTag("DSD "); putU64(28); putU64(0 /*file size, patched*/); putU64(0 /*metadata offset, patched*/);
             putTag("fmt "); putU64(52);
             putU32(1);          // format version
             putU32(0);          // format id: DSD raw
@@ -101,10 +158,10 @@ private:
             putTag("data"); putU64(0 /*patched*/);
         } else {
             putTag("FRM8"); putU64BE(0 /*patched*/); putTag("DSD ");
-            long start = std::ftell(f_);
+            int64_t start = tell64();
             putTag("FVER"); putU64BE(4); putU32BE(0x01050000);
             putTag("PROP"); putU64BE(0);  // patched below
-            long propStart = std::ftell(f_);
+            int64_t propStart = tell64();
             putTag("SND ");
             putTag("FS  "); putU64BE(4); putU32BE(rate_);
             putTag("CHNL"); putU64BE(2 + 4ull * channels_); putU16BE(uint16_t(channels_));
@@ -117,9 +174,9 @@ private:
             }
             putTag("CMPR"); putU64BE(4 + 1 + 14 + 1); putTag("DSD "); uint8_t len = 14; std::fwrite(&len, 1, 1, f_);
             std::fwrite("not compressed", 1, 14, f_); uint8_t pad = 0; std::fwrite(&pad, 1, 1, f_);
-            long propEnd = std::ftell(f_);
-            std::fseek(f_, propStart - 8, SEEK_SET); putU64BE(uint64_t(propEnd - propStart));
-            std::fseek(f_, propEnd, SEEK_SET);
+            int64_t propEnd = tell64();
+            seek64(propStart - 8); putU64BE(uint64_t(propEnd - propStart));
+            seek64(propEnd);
             dsdChunkOffset_ = static_cast<uint64_t>(propEnd);
             frm8BodyBeforeData_ = static_cast<uint64_t>(propEnd - start) + 4;  // + 'DSD ' form type
             putTag("DSD "); putU64BE(0 /*patched*/);

@@ -1,9 +1,9 @@
-# deltarec — PCM (WAV/FLAC) → 1bit DSD (DSF/DFF) オフラインコンバータ
+# deltarec — PCM (WAV/FLAC/CUE) → 1bit DSD (DSF/DFF) オフラインコンバータ
 
 [English README](README.md)
 
-deltarec は、WAV / FLAC を DSD64・DSD128・DSD256（・DSD512）の 1bit ストリームに変換し、
-DSF または DFF ファイルとして書き出すコマンドラインツールです。
+deltarec は、WAV / FLAC（および `.cue` シート）を DSD64・DSD128・DSD256（・DSD512）の 1bit ストリームに変換し、
+ソースファイルまたは CUE シートのタグ（ID3v2.3 メタデータおよびカバーアート）を埋め込んだ DSF または DFF ファイルとして書き出すコマンドラインツールです。
 依存ライブラリなし（単一ヘッダの dr_wav / dr_flac を同梱）、C++17、CMake で
 Windows (Visual Studio 2022/2026)・macOS (Xcode / Apple clang)・Linux (gcc / clang) でビルドできます。
 
@@ -63,20 +63,26 @@ Apple Silicon / Intel 両対応。追加のライブラリは不要です（pthr
 ## 使い方
 
 ```
-deltarec [options] input.(wav|flac) [-o output.dsf]
+deltarec [options] input1.(wav|flac|cue) [input2.(wav|flac|cue) ...] [-d outdir] [-o output.dsf]
 
-  -o, --output FILE     出力パス（省略時は入力名の拡張子を .dsf / .dff に）
+  -d, --outdir DIR      出力フォルダー（%tag% によるタグ展開に対応：
+                        例 "D:\DSD\[%album artist%] %album%-(%encoder%)"）
+                        ※ディスク枚数が2以上の場合は自動的に disc1, disc2... サブフォルダーを作成
+  -S, --subfolder PAT   --outdir 配下に作成するサブフォルダーパターン（例 "[%artist%] %album%"）
+  -o, --output FILE     出力ファイルパス（複数ファイル指定時やディレクトリ指定時は出力フォルダーとして動作）
   -r, --rate N          DSD 倍率: 64, 128, 256（既定）, 512
   -b, --base HZ         レートファミリ: 44100（既定）または 48000
   -f, --format FMT      dsf（既定）または dff
-      --order N         変調器の次数 2..8（既定 7）
-      --hinf X          NTF の帯域外ゲイン（Lee の基準、既定 1.4）
-                        大きいほどノイズシェーピングが強く、入力ヘッドルームは減る
+      --order N         変調器の次数 2..8（レート別既定値: DSD64=7, DSD128=5, DSD256/512=4）
+      --hinf X          NTF の帯域外ゲイン（Lee の基準、既定 1.4、またはプリセット名:
+                        standard=1.45, gentle=1.35, aggressive=1.55）
   -g, --gain DB         追加ゲイン dB（既定 0: PCM 0 dBFS → 変調度 50 %、SACD の慣例）
       --limit X         変調器入力のハードリミット 0..1（既定 0.6）
       --dither X        量子化器での TPDF ディザ量、0 で無効（既定 0.05）
       --passband HZ     アンチイメージフィルタの通過帯域端（既定 0.4535×fs_in ＝ 44.1 kHz 素材で 20 kHz）
       --attenuation DB  アンチイメージフィルタの阻止域減衰（既定 160）
+      --no-tags         ソースファイルのタグ・カバーアートを埋め込まない
+      --no-disc-folder  複数枚組アルバム時の discN サブフォルダー自動作成を無効化
       --info            設定に対する DSP 設計を表示して終了
   -q, --quiet           進捗表示なし
 ```
@@ -84,9 +90,12 @@ deltarec [options] input.(wav|flac) [-o output.dsf]
 例：
 
 ```sh
-deltarec album01.flac                       # DSD256 (11.2896 MHz) の .dsf を生成
-deltarec album01.flac -r 128                # DSD128
-deltarec album01.flac -r 64 -f dff          # DSD64 の .dff
+deltarec album01.flac                       # DSD256 (11.2896 MHz, 既定4次) の .dsf を生成（タグ埋め込み）
+deltarec album.cue -d "D:\DSD\[%album artist%] %album%-(%encoder%)" # CUEシートから曲分割＋タグ設定して出力
+deltarec *.flac -d "D:\DSD\[%album artist%] %album%-(%encoder%)"    # 複数ファイルをタグ名フォルダーへ一括変換
+deltarec disc1/*.flac disc2/*.flac -d "D:\DSD\%artist%\%album%"     # 2枚組以上は自動的に disc1/, disc2/ を作成
+deltarec album01.flac -r 128                # DSD128（既定5次）
+deltarec album01.flac -r 64 -f dff          # DSD64（既定7次）の .dff
 deltarec track.wav -g -3                    # 3 dB 下げて変調器のヘッドルームを確保
 deltarec hires96k.flac -b 48000             # 48 kHz 系 DSD（12.288 MHz）を使う
 deltarec track.flac --info                  # フィルタ・変調器の設計値を確認
@@ -110,7 +119,7 @@ DSD レートまでの 2 のべき乗倍で、イメージが遠いので位相�
 合計コストは DSD サンプルあたり 20 積和程度です。群遅延は整数サンプルに揃えて
 除去しているので、出力は入力とサンプル単位で位相が一致します。
 
-**ΔΣ変調器** — 7 次（既定）、誤差帰還形で NTF を厳密に実現（STF = 1）。NTF の零点は
+**ΔΣ変調器** — レートに応じた既定次数（DSD64 は 7 次、DSD128 は 5 次、DSD256/512 は 4 次、`--order` で 2..8 を手動指定可）、誤差帰還形で NTF を厳密に実現（STF = 1）。NTF の零点は
 Gauss–Legendre 節点（帯域内ノイズ電力を最小化する配置）、極は Butterworth 配置で
 ‖NTF‖∞ = H_inf となるよう二分探索。係数は実行時に `ntf.hpp` が設計するので、
 任意の次数・OSR・H_inf に対応します。ハードウェア向けの CIFB/CRFB 積分器連鎖を
@@ -120,7 +129,7 @@ Gauss–Legendre 節点（帯域内ノイズ電力を最小化する配置）、
 
 ### 測定値（同梱の `tools/verify_dsf.py` で再現可）
 
-24bit 1 kHz 正弦波 → DSD256（既定設定）を 20 kHz 帯域で評価：
+24bit 1 kHz 正弦波 → DSD256（`--order 7`）を 20 kHz 帯域で評価：
 
 | 入力レベル | 帯域内 SNR | 備考 |
 |---|---|---|
@@ -134,33 +143,37 @@ float32 の複合信号を DSD256 にして 20 kHz でブリックウォール�
 
 ## 対応フォーマット
 
-- 入力：WAV（8/16/24/32 bit 整数、32/64 bit float、WAVE_FORMAT_EXTENSIBLE）、FLAC（〜32 bit）。1〜6 ch。
+- 入力：WAV（8/16/24/32 bit 整数、32/64 bit float、WAVE_FORMAT_EXTENSIBLE）、FLAC（〜32 bit）、および CUE シート（`.cue`、自動トラック分割＆タグ設定）。1〜6 ch。複数ファイル・ワイルドカード・ディレクトリ指定に対応。
 - 出力：DSF（4096 byte ブロック・LSB ファースト）、DFF（DSDIFF 1.5、非圧縮）。
   どちらも 4 GB を超えるファイルに対応。
-- メタデータ（タグ）は CLI 版ではコピーしません（ID3v2 タグおよびアルバムアートの引き継ぎに対応した foobar2000 用プラグイン版は [`foo_deltarec`](https://github.com/yasudaz/foo_deltarec) を参照してください）。
+- メタデータ（タグ）：FLAC の Vorbis Comment / カバーアート（`PICTURE`）、WAV の `LIST INFO` / `ID3 ` チャンク、および CUE シートの内容を読み取り、ID3v2.3 (UTF-16) チャンクとして DSF / DFF に埋め込みます。
 
 ## 速度
 
-1 ch あたり 1 スレッド（マルチコア CPU では 1 ch あたり前段・後段の 2 スレッドパイプライン）。本フォークの AVX2・キャッシュタイリング最適化により、DSD256 で実時間の **7〜15 倍程度**（オリジナル `0.1.0` 比で出力結果 100% ビット完全一致のまま約 3.2 倍高速化）で変換できます。
+1 ch あたり 1 スレッド（＋前段 FIR 補間・ディザ生成用の専用パイプラインスレッド）。本フォークの AVX2・キャッシュタイリング最適化により、DSD256 で実時間の **7〜15 倍程度**（同一パラメータでオリジナル `0.1.0` 比 100% ビット完全一致のまま約 3.2 倍高速化）で変換できます。
 
 ## オリジナル（[Imaha486/deltarec](https://github.com/Imaha486/deltarec)）からの変更点
 
-本リポジトリは [Imaha486/deltarec](https://github.com/Imaha486/deltarec) をフォークし、以下の CPU パフォーマンス最適化を加えたものです（詳細は [CHANGELOG.md](CHANGELOG.md) を参照）：
+本リポジトリは [Imaha486/deltarec](https://github.com/Imaha486/deltarec) をフォークし、[`foo_deltarec`](https://github.com/yasudaz/foo_deltarec) からの機能バックポート、CUE シート自動分割機能、および CPU パフォーマンス最適化を加えたものです（詳細は [CHANGELOG.md](CHANGELOG.md) を参照）：
 
-1. **ポリフェーズ FIR の転置レイアウトと AVX2 ベクトル化 (`src/resampler.hpp`)**
-   - 2 のべき乗補間パス（`M == 1`：44.1/48 kHz 系の Stage 1 およびすべての Stage 2）向けに転置係数テーブル `ht_`（`[tapsPerPhase][L]`）を追加し、AVX2 FMA（`_mm256_fmadd_pd`）により 1 入力サンプルのブロードキャストに対して 4 位相分の積和を並列計算。
-2. **ΔΣ 変調器の状態更新 SIMD レジスタ常駐化と 2 パス分離 (`src/modulator.hpp`)**
-   - 7 次誤差帰還ループ内の状態ベクトル `s_[0..7]` と NTF 係数 `k_[0..7]` を 128-bit XMM レジスタに常駐化（`_mm_add_pd` / `_mm_mul_pd` / `_mm_alignr_epi8`）。
-   - 入力リミッタ（`[-limit, +limit]`）と xorshift64* による TPDF ディザ生成・加算を 1-bit 帰還ループの前段パスに分離し、逐次ループ内の分岐と乱数依存チェインを排除。
-3. **L1/L2 キャッシュ・タイリング (`src/main.cpp`)**
-   - 16,384 フレームのバッチを `ChannelPipe` 内で 512 フレーム単位のサブブロックに分割して処理することで、中間バッファ（Stage 1: `32 KB`、Stage 2: `1 MB`）が L1/L2 キャッシュに常駐するようにし、DRAM へのスピル（ch あたり約 32 MB）を解消。
-4. **チャンネル内ロックフリー SPSC パイプラインと常駐スレッドプール (`src/main.cpp`)**
-   - 論理コア数に余裕がある環境（`hc >= ch * 2`）では、2 スロットのロックフリーリングバッファによりブロック `N+1` の FIR アップサンプリング＋ディザ生成（`PrepWorker`）とブロック `N` の 1-bit ΔΣ 変調（`ModWorker`）を別コアでオーバーラップ実行。
-   - バッチごとの `std::thread` 生成・破棄を廃止し、ファイル変換全体でスレッドプール（`ChannelWorkerPool`）を再利用。
-5. **ビット完全一致（Bit-Exact）の保証**
-   - `/fp:precise` と IEEE-754 の演算順序を厳密に維持しており、オリジナル `0.1.0` と 1 バイトの狂いもない完全一致の `.dsf` / `.dff` を出力します。
+1. **DSD レートに応じたデフォルト変調器次数の自動選択 (`src/main.cpp`)**
+   - `--order` 未指定時のデフォルト次数を **DSD64 = 7 次**、**DSD128 = 5 次**、**DSD256 / DSD512 = 4 次** に変更（高 OSR 時の超高域ノイズピークを抑えつつ 140〜155 dB 超の帯域内 SNR を確保）。
+2. **ソースファイルのタグ＆カバーアート埋め込み (`src/id3v2_builder.hpp`, `src/decoder.hpp`, `src/dsdwriter.hpp`)**
+   - FLAC の Vorbis Comment・埋め込みカバー画像（`PICTURE`）および WAV の `LIST INFO`・`ID3 ` チャンクを読み取り、ID3v2.3 (UTF-16LE with BOM) として `.dsf` / `.dff` に自動埋め込み。
+3. **CUE シート（`.cue`）による自動曲データ分割＆タグ設定 (`src/cuesheet.hpp`, `src/main.cpp`)**
+   - 入力ファイルに `.cue` ファイルを指定した場合、参照先の音声ファイル（`.flac` / `.wav`）を `INDEX 01`（1/75 秒 CD セクタ精度）に従って自動的にトラックごとに分割して DSD 変換。
+   - テキストが UTF-8 以外（日本語 Shift-JIS / CP932 や UTF-16 等）の場合は自動的に UTF-8 に変換して文字化けを防止し、CUE シート内のアルバム情報・曲ごとのタイトル・アーティスト・作曲者・ISRC・`REM` タグ（`GENRE`, `DATE`, `DISCNUMBER` 等）を各トラックの ID3v2.3 タグに自動設定。
+   - `.cue` ファイルと同じフォルダーに `cover.jpg` が存在する場合は、これをカバーアート（`APIC`）として自動的に埋め込み（音声ファイル内蔵カバーアートへのフォールバックにも対応）。
+4. **複数ファイル一括処理・出力フォルダー指定・タグ展開・`discN` 自動作成 (`src/main.cpp`)**
+   - 複数ファイルやワイルドカード（`*.flac`, `*.cue`）、フォルダー入力の一括変換に対応。
+   - `-d, --outdir`（および `-S, --subfolder`）で `%artist%`, `%album artist%`, `%album%`, `%encoder%` 等のソースタグを利用した出力先フォルダー指定に対応。
+   - 出力フォルダー指定時、ディスク枚数が 2 枚以上のアルバム（`TOTALDISCS >= 2`、`DISCNUMBER` `N/M`、またはバッチ内の複数ディスク検出）では自動的に `disc1`, `disc2`... サブフォルダーを作成して出力。
+5. **CPU パフォーマンス最適化（約 3.2 倍高速化・DSP 出力ビット完全一致）**
+   - **ポリフェーズ FIR の転置レイアウトと AVX2 ベクトル化 (`src/resampler.hpp`)**
+   - **ΔΣ 変調器の状態更新 SIMD レジスタ常駐化と 2 パス分離 (`src/modulator.hpp`)**
+   - **L1/L2 キャッシュ・タイリングとチャンネル内ロックフリー SPSC パイプライン (`src/main.cpp`)**
 
-また、本エンジンをベースに foobar2000 上の任意のデコード可能フォーマットから右クリックで DSD 変換・ID3v2 タグ＆カバーアートのコピーを行うプラグイン版を **[yasudaz/foo_deltarec](https://github.com/yasudaz/foo_deltarec)** にて公開しています。
+また、本エンジンをベースに foobar2000 上の任意のデコード可能フォーマットから右クリックで DSD 変換を行うプラグイン版を **[yasudaz/foo_deltarec](https://github.com/yasudaz/foo_deltarec)** にて公開しています。
 
 ## ライセンスと特許について
 
